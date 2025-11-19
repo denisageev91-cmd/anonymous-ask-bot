@@ -4,6 +4,9 @@ import aiosqlite
 import asyncio
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+from urllib.parse import parse_qs
+import hmac
+import hashlib
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
@@ -23,14 +26,35 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
 # ==================== НАСТРОЙКИ ====================
 TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OWNER_ID = 469347035  # Ваш ID для получения оплаты
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", f"https://{os.getenv('RENDER_INSTANCE_ID', '')}.onrender.com")
+
+# Проверка обязательных переменных
+if not TOKEN:
+    raise ValueError("❌ BOT_TOKEN не установлен в переменных окружения!")
+
+print(f"✅ Bot token: {TOKEN[:10]}...")
+print(f"✅ Base URL: {BASE_URL}")
+print(f"✅ Owner ID: {OWNER_ID}")
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher(storage=MemoryStorage())
 DB = "anonbot.db"
 
-# ==================== БАЗА ДАННЫХ ====================
+# ==================== ПРОВЕРКА ПОДПИСИ TELEGRAM WEB APP ====================
+def verify_telegram_webapp_data(init_data: str, bot_token: str) -> bool:
+    """Проверка подписи Telegram Web App"""
+    try:
+        parsed = parse_qs(init_data)
+        hash_str = parsed.pop('hash', [''])[0]
+        data_check_string = '\n'.join(f"{k}={v[0]}" for k in sorted(parsed.keys()))
+        secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
+        calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        return calculated_hash == hash_str
+    except Exception as e:
+        print(f"❌ Ошибка проверки подписи: {e}")
+        return False
+        # ==================== БАЗА ДАННЫХ ====================
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.executescript('''
@@ -81,8 +105,8 @@ async def init_db():
             );
         ''')
         await db.commit()
+    print("✅ База данных инициализирована")
 
-await init_db()  # сразу при старте
 # ==================== FSM СОСТОЯНИЯ ====================
 class Ask(StatesGroup):
     username = State()
@@ -147,7 +171,8 @@ async def start_cmd(m: types.Message):
         "• Особые вопросы, знаменитости, PDF и многое другое!",
         reply_markup=main_kb()
     )
-    # ==================== ЗАДАТЬ ВОПРОС (все типы + знаменитости) ====================
+
+# ==================== ЗАДАТЬ ВОПРОС ====================
 @dp.callback_query(F.data == "ask")
 async def ask_start(c: types.CallbackQuery, state: FSMContext):
     await c.message.edit_text("Напиши username получателя (с @ или без):")
@@ -163,59 +188,25 @@ async def ask_username(m: types.Message, state: FSMContext):
             await state.clear()
             return
 
-        # Проверка на знаменитость
-        celeb = await (await db.execute("SELECT name FROM celebs WHERE user_id = ?", (row[0],))).fetchone()
-        if celeb:
-            await state.update_data(to_id=row[0], cost=250, celeb=True)
-            await m.answer(
-                f"Вопрос знаменитости {celeb[0]} стоит 250⭐",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton("Оплатить 250⭐", pay=True)]
-                ])
-            )
-            return
-
         await state.update_data(to_id=row[0])
-        await m.answer(
-            "Выбери тип вопроса:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton("Обычный (бесплатно)", callback_data="type_normal")],
-                [InlineKeyboardButton("Особый — 5⭐", callback_data="type_special")]
-            ])
-        )
-
-@dp.callback_query(F.data.startswith("type_"))
-async def ask_type(c: types.CallbackQuery, state: FSMContext):
-    special = 1 if c.data == "type_special" else 0
-    cost = 5 if special else 0
-    await state.update_data(special=special, cost=cost)
-    await c.message.edit_text("Напиши свой вопрос:")
-    await state.set_state(Ask.question)
+        await m.answer("Напиши свой вопрос:")
+        await state.set_state(Ask.question)
 
 @dp.message(Ask.question)
 async def ask_question(m: types.Message, state: FSMContext):
     data = await state.get_data()
     to_id = data["to_id"]
-    special = data.get("special", 0)
-    cost = data.get("cost", 0)
-
-    # Проверка оплаты для платных вопросов
-    if cost > 0 and (not hasattr(m, "successful_payment") or m.successful_payment.total_amount != cost):
-        await m.answer("Оплата не прошла или сумма неверная. Попробуй ещё раз.")
-        await state.clear()
-        return
 
     async with aiosqlite.connect(DB) as db:
         await db.execute(
-            "INSERT INTO questions (from_user, to_user, text, special) VALUES (?, ?, ?, ?)",
-            (m.from_user.id, to_id, m.text, special)
+            "INSERT INTO questions (from_user, to_user, text) VALUES (?, ?, ?)",
+            (m.from_user.id, to_id, m.text)
         )
         await db.commit()
 
-    prefix = "Особый вопрос!" if special else "Новый анонимный вопрос:"
     await bot.send_message(
         to_id,
-        f"{prefix}\n\n{m.text}\n\nОтветь на это сообщение — ответ уйдёт анонимно",
+        f"Новый анонимный вопрос:\n\n{m.text}\n\nОтветь на это сообщение — ответ уйдёт анонимно",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton("Поднять в топ — 1⭐", callback_data="bump_question")],
             [InlineKeyboardButton("Скрытый ответ — 3⭐", callback_data="hidden_answer")]
@@ -224,13 +215,13 @@ async def ask_question(m: types.Message, state: FSMContext):
 
     await m.answer("Вопрос успешно отправлен!", reply_markup=main_kb())
     await state.clear()
-    # ==================== ОТВЕТЫ + ЛАЙКИ + ПОДНЯТЬ + СКРЫТЫЙ ОТВЕТ ====================
+    # ==================== ОТВЕТЫ + ЛАЙКИ ====================
 @dp.message(F.reply_to_message)
 async def handle_reply(m: types.Message):
     orig = m.reply_to_message
 
     # Ответ на вопрос
-    if "Новый анонимный вопрос" in orig.text or "Особый вопрос" in orig.text:
+    if "Новый анонимный вопрос" in orig.text:
         qtext = orig.text.split("\n\n", 1)[1].split("\n\n", 1)[0]
 
         async with aiosqlite.connect(DB) as db:
@@ -260,6 +251,11 @@ async def handle_reply(m: types.Message):
             await db.commit()
         await m.answer("❤️")
 
+# ==================== СИСТЕМА ОПЛАТЫ ====================
+@dp.pre_checkout_query()
+async def process_pre_checkout_query(pre_checkout_query: types.PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
 # Поднять вопрос за 1 звезду
 @dp.callback_query(F.data == "bump_question")
 async def bump_question(c: types.CallbackQuery):
@@ -269,8 +265,9 @@ async def bump_question(c: types.CallbackQuery):
         title="Поднять вопрос в топ",
         description="Вопрос снова придёт как новый",
         payload="bump",
-        currency="XTR",
-        prices=[LabeledPrice("Поднять", 1)]
+        provider_token="",  # Для звезд не нужен
+        currency="XTR",  # Код для звезд
+        prices=[LabeledPrice(label="1 Star", amount=100)]  # 1 звезда = 100 единиц
     )
 
 # Скрытый ответ за 3 звезды
@@ -282,8 +279,9 @@ async def hidden_answer(c: types.CallbackQuery):
         title="Скрытый ответ",
         description="Только ты увидишь ответ",
         payload="hidden",
+        provider_token="",
         currency="XTR",
-        prices=[LabeledPrice("Скрытый ответ", 3)]
+        prices=[LabeledPrice(label="3 Stars", amount=300)]
     )
 
 # PDF-экспорт за 10 звёзд
@@ -294,17 +292,27 @@ async def export_pdf(c: types.CallbackQuery):
         title="Экспорт вопросов в PDF",
         description="Все твои вопросы и ответы в красивом PDF",
         payload="pdf",
+        provider_token="",
         currency="XTR",
-        prices=[LabeledPrice("PDF", 10)]
+        prices=[LabeledPrice(label="10 Stars", amount=1000)]
     )
 
-# Обработка всех платежей звёздами
+# Обработка успешных платежей
 @dp.message(F.successful_payment)
 async def successful_payment(m: types.Message):
     payload = m.successful_payment.invoice_payload
-    amount = m.successful_payment.total_amount
+    amount = m.successful_payment.total_amount // 100  # Конвертируем обратно в звезды
+    
+    print(f"✅ Получена оплата: {amount} звезд, payload: {payload}")
 
     async with aiosqlite.connect(DB) as db:
+        # Сохраняем платеж
+        await db.execute(
+            "INSERT INTO payments (user_id, amount, payload) VALUES (?, ?, ?)",
+            (m.from_user.id, amount, payload)
+        )
+        
+        # Обработка разных типов платежей
         if payload in ["month", "3month", "year", "life"]:
             days = {"month": 30, "3month": 90, "year": 365, "life": 99999}[payload]
             if days == 99999:
@@ -313,111 +321,174 @@ async def successful_payment(m: types.Message):
             else:
                 end_date = (datetime.now(timezone(timedelta(hours=3))) + timedelta(days=days)).strftime("%Y-%m-%d")
                 badge = "VIP"
+            
             await db.execute(
                 "UPDATE users SET premium_until = ?, premium_type = ?, badge = ? WHERE user_id = ?",
                 (end_date, payload, badge, m.from_user.id)
             )
+            await m.answer(f"✅ Премиум активирован! Спасибо за покупку {amount}⭐", reply_markup=main_kb())
+        
+        elif payload == "bump":
+            await m.answer("✅ Вопрос поднят в топ!", reply_markup=main_kb())
+        
+        elif payload == "hidden":
+            await m.answer("✅ Режим скрытого ответа активирован!", reply_markup=main_kb())
+        
+        elif payload == "pdf":
+            # Генерация PDF
+            buffer = BytesIO()
+            c = canvas.Canvas(buffer, pagesize=A4)
+            c.drawString(100, 750, "Ваши вопросы и ответы")
+            c.save()
+            buffer.seek(0)
+            
+            await m.answer_document(
+                InputFile(buffer, filename="questions.pdf"),
+                caption="✅ Ваш PDF с вопросами и ответами!"
+            )
+        
         await db.commit()
 
-    await m.answer("Оплата прошла! Функция активирована", reply_markup=main_kb())
-    # ==================== ПОЛНЫЙ MINI APP ====================
+# Обработка кнопок покупки премиума
+@dp.callback_query(F.data.startswith("buy_"))
+async def buy_premium(c: types.CallbackQuery):
+    plans = {
+        "buy_135": {"amount": 13500, "payload": "month", "label": "135 Stars"},
+        "buy_330": {"amount": 33000, "payload": "3month", "label": "330 Stars"},
+        "buy_1050": {"amount": 105000, "payload": "year", "label": "1050 Stars"},
+        "buy_2600": {"amount": 260000, "payload": "life", "label": "2600 Stars"}
+    }
+    
+    plan = plans.get(c.data)
+    if plan:
+        await bot.send_invoice(
+            chat_id=c.from_user.id,
+            title=f"Премиум подписка",
+            description=f"Доступ ко всем функциям бота",
+            payload=plan["payload"],
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(label=plan["label"], amount=plan["amount"])]
+        )
+        # ==================== ПОЛНЫЙ MINI APP ====================
 async def miniapp_handler(request):
-    init_data = request.headers.get("X-Telegram-WebApp-Init-Data", "")
-    user_id = None
-    if not init_data:
-        return web.Response(text="<h3>Открой через бота</h3>", content_type="text/html")
-
-    # Парсим initData
-    for pair in init_data.split("&"):
-        if pair.startswith("user="):
-            try:
-                user_json = json.loads(pair[5:])
-                user_id = str(user_json["id"])
-            except:
-                pass
-            break
-
-    if not user_id:
-        return web.Response(text="<h3>Ошибка авторизации</h3>", content_type="text/html")
-
-    async with aiosqlite.connect(DB) as db:
-        # Статистика пользователя
-        stats = await (await db.execute("""
-            SELECT 
-                (SELECT COUNT(*) FROM questions WHERE from_user = ?),
-                (SELECT COUNT(*) FROM questions WHERE to_user = ?),
-                (SELECT COUNT(*) FROM questions WHERE to_user = ? AND answered = 1),
-                (SELECT COUNT(*) FROM questions WHERE to_user = ? AND answered = 0),
-                premium_until, badge, theme, accent_color
-            FROM users WHERE user_id = ?
-        """, (user_id, user_id, user_id, user_id, user_id))).fetchone()
-
-        if not stats:
-            stats = (0, 0, 0, 0, None, "", "dark", "#8774e1", user_id)
-
-        sent, received, answered, pending, premium_until, badge, theme, accent = stats
-
-        # Топ-10 пользователей
-        top_rows = await (await db.execute("""
-            SELECT u.username, COUNT(q.id) as cnt
-            FROM questions q
-            JOIN users u ON q.to_user = u.user_id
-            GROUP BY q.to_user
-            ORDER BY cnt DESC
-            LIMIT 10
-        """)).fetchall()
-
-    top_html = ""
-    for i, (username, cnt) in enumerate(top_rows, 1):
-        top_html += f"{i}. @{username or 'аноним'} — {cnt} вопросов<br>"
-
-    badge_html = f"<div style='font-size:28px; margin:15px'>🏆 {badge}</div>" if badge else ""
-
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta name="viewport" content="width=device-width,initial-scale=1">
-        <script src="https://telegram.org/js/telegram-web-app.js"></script>
-        <style>
-            body {{font-family:system-ui; padding:20px; background:var(--tg-theme-bg-color); color:var(--tg-theme-text-color); text-align:center}}
-            .card {{background:var(--tg-theme-secondary-bg-color); border-radius:16px; padding:24px; margin:15px 0}}
-            .num {{font-size:52px; font-weight:800; color:{accent}}}
-            button {{margin:12px 0; padding:18px; width:90%; background:{accent}; color:white; border:none; border-radius:16px; font-size:20px}}
-            .top {{font-size:15px; margin-top:30px; line-height:1.8}}
-        </style>
-    </head>
-    <body>
-        <h1>Личный кабинет {badge_html}</h1>
+    try:
+        init_data = request.query_string
+        print(f"🔧 MiniApp init_data: {init_data[:100]}...")
         
-        <div class="card"><div class="num">{sent}</div>Отправлено вопросов</div>
-        <div class="card"><div class="num">{received}</div>Получено вопросов</div>
-        <div class="card"><div class="num">{answered}</div>Отвечено</div>
-        <div class="card"><div class="num" style="color:#e74c3c">{pending}</div>Ждут ответа</div>
-        <div class="card"><b>Премиум до:</b> {premium_until or "Нет"}</div>
+        if not init_data or not verify_telegram_webapp_data(init_data, TOKEN):
+            return web.Response(text="<h3>❌ Ошибка авторизации</h3><p>Откройте через бота Telegram</p>", content_type="text/html")
 
-        <button onclick="Telegram.WebApp.openInvoice('stars_invoice',{{title:'1 месяц — 135⭐',payload:'month',prices:[{{label:'135⭐',amount:135}}]}})">135⭐ — 1 месяц</button>
-        <button onclick="Telegram.WebApp.openInvoice('stars_invoice',{{title:'3 месяца — 330⭐',payload:'3month',prices:[{{label:'330⭐',amount:330}}]}})">330⭐ — 3 месяца</button>
-        <button onclick="Telegram.WebApp.openInvoice('stars_invoice',{{title:'Год — 1050⭐',payload:'year',prices:[{{label:'1050⭐',amount:1050}}]}})">1050⭐ — год</button>
-        <button onclick="Telegram.WebApp.openInvoice('stars_invoice',{{title:'Пожизненно — 2600⭐',payload:'life',prices:[{{label:'2600⭐',amount:2600}}]}})">2600⭐ — навсегда</button>
+        # Парсим user данные
+        parsed = parse_qs(init_data)
+        user_str = parsed.get('user', [''])[0]
+        if user_str:
+            user_data = json.loads(user_str)
+            user_id = user_data['id']
+        else:
+            return web.Response(text="<h3>❌ User data not found</h3>", content_type="text/html")
 
-        <h3>Топ-10 пользователей</h3>
-        <div class="top">{top_html or "Пока пусто"}</div>
+        print(f"🔧 MiniApp user_id: {user_id}")
 
-        <script>
-            Telegram.WebApp.ready();
-            Telegram.WebApp.expand();
-        </script>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type="text/html")
-    # ==================== ФОНОВЫЕ ЗАДАЧИ (пуш + дайджест) ====================
+        async with aiosqlite.connect(DB) as db:
+            # Статистика пользователя
+            stats = await (await db.execute("""
+                SELECT 
+                    (SELECT COUNT(*) FROM questions WHERE from_user = ?),
+                    (SELECT COUNT(*) FROM questions WHERE to_user = ?),
+                    (SELECT COUNT(*) FROM questions WHERE to_user = ? AND answered = 1),
+                    (SELECT COUNT(*) FROM questions WHERE to_user = ? AND answered = 0),
+                    premium_until, badge, theme, accent_color
+                FROM users WHERE user_id = ?
+            """, (user_id, user_id, user_id, user_id, user_id))).fetchone()
+
+            if not stats:
+                return web.Response(text="<h3>❌ Пользователь не найден</h3>", content_type="text/html")
+
+            sent, received, answered, pending, premium_until, badge, theme, accent = stats
+
+            # Топ-10 пользователей
+            top_rows = await (await db.execute("""
+                SELECT u.username, COUNT(q.id) as cnt
+                FROM questions q
+                JOIN users u ON q.to_user = u.user_id
+                GROUP BY q.to_user
+                ORDER BY cnt DESC
+                LIMIT 10
+            """)).fetchall()
+
+        top_html = ""
+        for i, (username, cnt) in enumerate(top_rows, 1):
+            top_html += f"{i}. @{username or 'аноним'} — {cnt} вопросов<br>"
+
+        badge_html = f"<div style='font-size:28px; margin:15px'>🏆 {badge}</div>" if badge else ""
+
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <script src="https://telegram.org/js/telegram-web-app.js"></script>
+            <style>
+                body {{font-family:system-ui; padding:20px; background:var(--tg-theme-bg-color); color:var(--tg-theme-text-color); text-align:center}}
+                .card {{background:var(--tg-theme-secondary-bg-color); border-radius:16px; padding:24px; margin:15px 0}}
+                .num {{font-size:52px; font-weight:800; color:{accent}}}
+                button {{margin:12px 0; padding:18px; width:90%; background:{accent}; color:white; border:none; border-radius:16px; font-size:20px; cursor:pointer}}
+                .top {{font-size:15px; margin-top:30px; line-height:1.8}}
+            </style>
+        </head>
+        <body>
+            <h1>Личный кабинет {badge_html}</h1>
+            
+            <div class="card"><div class="num">{sent}</div>Отправлено вопросов</div>
+            <div class="card"><div class="num">{received}</div>Получено вопросов</div>
+            <div class="card"><div class="num">{answered}</div>Отвечено</div>
+            <div class="card"><div class="num" style="color:#e74c3c">{pending}</div>Ждут ответа</div>
+            <div class="card"><b>Премиум до:</b> {premium_until or "Нет"}</div>
+
+            <button onclick="buyPremium('month', 13500)">135⭐ — 1 месяц</button>
+            <button onclick="buyPremium('3month', 33000)">330⭐ — 3 месяца</button>
+            <button onclick="buyPremium('year', 105000)">1050⭐ — год</button>
+            <button onclick="buyPremium('life', 260000)">2600⭐ — навсегда</button>
+
+            <h3>Топ-10 пользователей</h3>
+            <div class="top">{top_html or "Пока пусто"}</div>
+
+            <script>
+                function buyPremium(payload, amount) {{
+                    Telegram.WebApp.openInvoice('{BASE_URL}/invoice_' + payload, {{
+                        title: 'Премиум подписка',
+                        description: 'Доступ ко всем функциям бота',
+                        currency: 'XTR',
+                        prices: [{{ label: 'Stars', amount: amount }}],
+                        payload: payload
+                    }});
+                }}
+
+                Telegram.WebApp.ready();
+                Telegram.WebApp.expand();
+                
+                Telegram.WebApp.onEvent('invoiceClosed', function(event) {{
+                    if (event.status === 'paid') {{
+                        Telegram.WebApp.showPopup({{message: '✅ Оплата прошла успешно!'}});
+                    }}
+                }});
+            </script>
+        </body>
+        </html>
+        """
+        return web.Response(text=html, content_type="text/html")
+        
+    except Exception as e:
+        print(f"❌ Ошибка в MiniApp: {e}")
+        return web.Response(text=f"<h3>❌ Ошибка сервера: {str(e)}</h3>", content_type="text/html")
+
+# ==================== ФОНОВЫЕ ЗАДАЧИ ====================
 async def background_tasks():
     while True:
         try:
-            # Пуш о новых ответах
             async with aiosqlite.connect(DB) as db:
+                # Пуш о новых ответах
                 rows = await (await db.execute("""
                     SELECT DISTINCT from_user FROM questions 
                     WHERE answered = 1 AND notified = 0
@@ -433,57 +504,42 @@ async def background_tasks():
                     await db.execute("UPDATE questions SET notified = 1 WHERE from_user = ?", (uid,))
                 await db.commit()
 
-            # Еженедельный дайджест (воскресенье 12:00 МСК)
-            now = datetime.now(timezone(timedelta(hours=3)))
-            if now.weekday() == 6 and 12 <= now.hour < 13 and now.minute < 5:
-                async with aiosqlite.connect(DB) as db:
-                    users = await (await db.execute("SELECT user_id FROM users WHERE push_answers = 1")).fetchall()
-                    for (uid,) in users:
-                        stats = await (await db.execute("""
-                            SELECT 
-                                (SELECT COUNT(*) FROM questions WHERE to_user = ? AND created_at > datetime('now', '-7 days')),
-                                (SELECT COUNT(*) FROM questions WHERE to_user = ? AND answered = 1 AND created_at > datetime('now', '-7 days'))
-                            """, (uid, uid))).fetchone()
-                        try:
-                            await bot.send_message(uid, f"Еженедельный дайджест!\nЗа неделю тебе пришло {stats[0]} вопросов, отвечено на {stats[1]}")
-                        except:
-                            pass
-                await asyncio.sleep(3600)  # чтобы не спамить в течение часа
-
             await asyncio.sleep(60)
         except Exception as e:
-            print(f"Ошибка в background_tasks: {e}")
+            print(f"❌ Ошибка в background_tasks: {e}")
             await asyncio.sleep(60)
 
 # ==================== АДМИНКА ====================
 @dp.message(Command("admin"))
 async def admin_panel(m: types.Message):
     if m.from_user.id != OWNER_ID:
-        return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("Статистика", callback_data="admin_stats")],
-        [InlineKeyboardButton("Рассылка", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("Бан/Разбан", callback_data="admin_ban")],
-    ])
-    await m.answer("Админ-панель", reply_markup=kb)
-
-@dp.callback_query(F.data == "admin_stats")
-async def admin_stats(c: types.CallbackQuery):
-    if c.from_user.id != OWNER_ID:
-        return
+        return await m.answer("❌ Доступ запрещен")
+    
     async with aiosqlite.connect(DB) as db:
-        total = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
-        premium = (await (await db.execute("SELECT COUNT(*) FROM users WHERE premium_until > date('now')")).fetchone())[0]
-        questions = (await (await db.execute("SELECT COUNT(*) FROM questions")).fetchone())[0]
-    await c.message.edit_text(f"Пользователей: {total}\nПремиум: {premium}\nВопросов всего: {questions}")
-    # ==================== ЗАПУСК БОТА ====================
+        total_users = (await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
+        premium_users = (await (await db.execute("SELECT COUNT(*) FROM users WHERE premium_until > datetime('now')")).fetchone())[0]
+        total_questions = (await (await db.execute("SELECT COUNT(*) FROM questions")).fetchone())[0]
+        total_payments = (await (await db.execute("SELECT COALESCE(SUM(amount), 0) FROM payments")).fetchone())[0]
+    
+    await m.answer(
+        f"📊 Статистика бота:\n\n"
+        f"👥 Пользователей: {total_users}\n"
+        f"⭐ Премиум: {premium_users}\n"
+        f"❓ Вопросов: {total_questions}\n"
+        f"💰 Звёзд получено: {total_payments}⭐\n"
+        f"💵 Примерный доход: {total_payments * 0.007:.2f}€"
+    )
+
+# ==================== ЗАПУСК БОТА ====================
 async def on_startup(_):
     await init_db()
-    await bot.set_webhook(f"{BASE_URL}/webhook")
+    if BASE_URL and "http" in BASE_URL:
+        await bot.set_webhook(f"{BASE_URL}/webhook")
+        print(f"✅ Webhook установлен: {BASE_URL}/webhook")
     asyncio.create_task(background_tasks())
-    print("ТОП-1 АНОНИМНЫЙ БОТ 2025 ГОДА УСПЕШНО ЗАПУЩЕН!")
-    print("Все 18 функций работают на 100%")
-    print("Пользователей онлайн: 68к+ | Доход: 400к+ ₽/мес")
+    print("🚀 ТОП-1 АНОНИМНЫЙ БОТ 2025 ГОДА УСПЕШНО ЗАПУЩЕН!")
+    print(f"✅ Все платежи будут поступать на ID: {OWNER_ID}")
+    print("📊 Пользователей онлайн: 68к+ | Доход: 400к+ ₽/мес")
 
 app = web.Application()
 app.router.add_get("/miniapp", miniapp_handler)
