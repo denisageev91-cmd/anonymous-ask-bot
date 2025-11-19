@@ -1,4 +1,3 @@
-```python
 import os
 import aiosqlite
 from datetime import datetime, timedelta
@@ -12,6 +11,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.default import DefaultBotProperties
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
+# === НАСТРОЙКИ ===
 TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", f"https://{os.getenv('RENDER_INSTANCE_ID')}.onrender.com")
@@ -21,6 +21,7 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 DB = "data.db"
 
+# === БАЗА ===
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.executescript('''
@@ -40,9 +41,17 @@ async def init_db():
         ''')
         await db.commit()
 
+# === СОСТОЯНИЯ ===
 class Ask(StatesGroup):
     username = State()
     question = State()
+
+# === КНОПКА ВСЕГДА ===
+def get_main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Личный кабинет", web_app=WebAppInfo(url=f"{BASE_URL}/miniapp"))],
+        [InlineKeyboardButton(text="Задать вопрос", callback_data="ask")]
+    ])
 
 # === СТАРТ ===
 @dp.message(Command("start"))
@@ -59,21 +68,17 @@ async def start(m: types.Message):
             await db.execute("UPDATE users SET trial_end=? WHERE user_id=?", (end, m.from_user.id))
         await db.commit()
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Личный кабинет", web_app=WebAppInfo(url=f"{BASE_URL}/miniapp"))],
-        [InlineKeyboardButton(text="Задать вопрос", callback_data="ask")]
-    ])
     await m.answer(
         "Анонимные вопросы\n\n"
-        "Пробный безлимит — 3 дня!\n"
-        "Отвечай на вопросы прямо в чате — ответ уйдёт анонимно",
-        reply_markup=kb
+        "Пробный безлимит — 3 дня\n"
+        "Отвечай прямо на сообщение — ответ уйдёт анонимно",
+        reply_markup=get_main_keyboard()
     )
 
 # === ЗАДАТЬ ВОПРОС ===
 @dp.callback_query(lambda c: c.data == "ask")
 async def ask_cb(c: types.CallbackQuery, state: FSMContext):
-    await c.message.edit_text("Напиши username (с @ или без):")
+    await c.message.edit_text("Напиши username (с @ или без):", reply_markup=None)
     await state.set_state(Ask.username)
 
 @dp.message(Ask.username)
@@ -83,10 +88,11 @@ async def get_username(m: types.Message, state: FSMContext):
         cur = await db.execute("SELECT user_id FROM users WHERE LOWER(username)=?", (username,))
         row = await cur.fetchone()
     if not row:
-        await m.answer("Этот пользователь ещё не запускал бота")
+        await m.answer("Этот пользователь ещё не запускал бота", reply_markup=get_main_keyboard())
+        await state.clear()
         return
     await state.update_data(to_id=row[0])
-    await m.answer("Напиши вопрос:")
+    await m.answer("Напиши вопрос:", reply_markup=None)
     await state.set_state(Ask.question)
 
 @dp.message(Ask.question)
@@ -96,11 +102,18 @@ async def get_question(m: types.Message, state: FSMContext):
         await db.execute("INSERT INTO questions (from_user, to_user, text) VALUES (?, ?, ?)",
                         (m.from_user.id, data["to_id"], m.text))
         await db.commit()
+
     await bot.send_message(data["to_id"],
         f"Новый анонимный вопрос:\n\n{m.text}\n\n"
         "Ответь на это сообщение — ответ уйдёт анонимно"
     )
-    await m.answer("Вопрос отправлен анонимно")
+
+    # Кнопка "Задать ещё один"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Задать ещё один вопрос", callback_data="ask")],
+        [InlineKeyboardButton(text="Личный кабинет", web_app=WebAppInfo(url=f"{BASE_URL}/miniapp"))]
+    ])
+    await m.answer("Вопрос отправлен анонимно", reply_markup=kb)
     await state.clear()
 
 # === ОТВЕТ НА ВОПРОС ===
@@ -122,68 +135,71 @@ async def answer_to_question(m: types.Message):
                 )
                 await db.commit()
                 await bot.send_message(from_user, f"Тебе ответили анонимно:\n\n{m.text}")
-                await m.answer("Ответ отправлен анонимно")
+                await m.answer("Ответ отправлен анонимно", reply_markup=get_main_keyboard())
                 return
 
-# === MINI APP — ЛИЧНЫЙ КАБИНЕТ ===
+# === MINI APP — ЛИЧНЫЙ КАБИНЕТ СО СЧЁТЧИКАМИ ===
 async def miniapp_handler(request):
     user_id = request.query.get("user_id")
     if not user_id:
-        return web.Response(text="Ошибка авторизации", status=400)
+        return web.Response(text="Ошибка", status=400)
 
     async with aiosqlite.connect(DB) as db:
-        # Статистика
-        sent = await (await db.execute("SELECT COUNT(*) FROM questions WHERE from_user=?", (user_id,))).fetchone()
-        received = await (await db.execute("SELECT COUNT(*) FROM questions WHERE to_user=?", (user_id,))).fetchone()
-        answered = await (await db.execute("SELECT COUNT(*) FROM questions WHERE to_user=? AND answered=1", (user_id,))).fetchone()
-        pending = received[0] - answered[0]
+        sent = (await (await db.execute("SELECT COUNT(*) FROM questions WHERE from_user=?", (user_id,))).fetchone())[0]
+        received = (await (await db.execute("SELECT COUNT(*) FROM questions WHERE to_user=?", (user_id,))).fetchone())[0]
+        answered = (await (await db.execute("SELECT COUNT(*) FROM questions WHERE to_user=? AND answered=1", (user_id,))).fetchone())[0]
+        pending = received - answered
 
     html = f"""
     <!DOCTYPE html>
     <html>
     <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
         <script src="https://telegram.org/js/telegram-web-app.js"></script>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-            body {{font-family: Arial; padding: 20px; background: var(--tg-theme-bg-color); color: var(--tg-theme-text-color); text-align: center;}}
-            .card {{background: var(--tg-theme-secondary-bg-color); border-radius: 16px; padding: 20px; margin: 15px 0;}}
-            .num {{font-size: 42px; font-weight: bold; color: var(--tg-theme-accent-text-color);}}
-            button {{width:90%; padding:18px; margin:20px 0; background:var(--tg-theme-button-color); color:var(--tg-theme-button-text-color); border:none; border-radius:16px; font-size:20px;}}
+            body {{font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                  padding: 20px; background: var(--tg-theme-bg-color); color: var(--tg-theme-text-color); text-align: center;}}
+            h1 {{margin-bottom: 30px;}}
+            .stats {{display: grid; gap: 16px;}}
+            .card {{background: var(--tg-theme-secondary-bg-color); border-radius: 16px; padding: 20px;}}
+            .num {{font-size: 48px; font-weight: 800; margin: 8px 0; color: var(--tg-theme-accent-text-color);}}
+            .label {{font-size: 16px; opacity: 0.9;}}
+            button {{margin-top: 30px; padding: 16px; width: 90%; background: var(--tg-theme-button-color);
+                    color: var(--tg-theme-button-text-color); border: none; border-radius: 16px; font-size: 18px;}}
         </style>
     </head>
     <body>
         <h1>Личный кабинет</h1>
-        <div class="card">
-            <div class="num">{sent[0]}</div>
-            <div>Отправлено вопросов</div>
-        </div>
-        <div class="card">
-            <div class="num">{received[0]}</div>
-            <div>Получено вопросов</div>
-        </div>
-        <div class="card">
-            <div class="num">{answered[0]}</div>
-            <div>Отвечено</div>
-        </div>
-        <div class="card">
-            <div class="num" style="color:#e74c3c;">{pending};">{pending}</div>
-            <div>Ждут ответа</div>
+        <div class="stats">
+            <div class="card">
+                <div class="num">{sent}</div>
+                <div class="label">Отправлено вопросов</div>
+            </div>
+            <div class="card">
+                <div class="num">{received}</div>
+                <div class="label">Получено вопросов</div>
+            </div>
+            <div class="card">
+                <div class="num">{answered}</div>
+                <div class="label">Отвечено</div>
+            </div>
+            <div class="card">
+                <div class="num" style="color:#e74c3c;">{pending}</div>
+                <div class="label">Ждут ответа</div>
+            </div>
         </div>
         <button onclick="Telegram.WebApp.close()">Закрыть</button>
-        <script>
-            Telegram.WebApp.ready();
-            Telegram.WebApp.expand();
-        </script>
+        <script>Telegram.WebApp.ready(); Telegram.WebApp.expand();</script>
     </body>
     </html>
     """
     return web.Response(text=html, content_type='text/html')
 
-# === WEBHOOK + MINIAPP ===
+# === ЗАПУСК ===
 async def on_startup(_):
     await init_db()
     await bot.set_webhook(f"{BASE_URL}/webhook")
-    print("Бот запущен!")
+    print("Бот запущен и готов к бою!")
 
 app = web.Application()
 app.router.add_get("/miniapp", miniapp_handler)
